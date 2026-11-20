@@ -1,0 +1,6 @@
+FROM public.ecr.aws/lambda/python:3.12
+COPY requirements.aws.txt .
+RUN pip install --no-cache-dir -r requirements.aws.txt
+COPY main.py training_examples.py lambda_handler.py ${LAMBDA_TASK_ROOT}/
+ENV STORAGE_BACKEND=dynamodb
+CMD ["lambda_handler.handler"]

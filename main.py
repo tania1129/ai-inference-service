@@ -3,6 +3,7 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Literal
 from uuid import uuid4
 
@@ -17,15 +18,20 @@ from training_examples import EXAMPLES
 logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+@lru_cache(maxsize=1)
+def train_model():
     texts, labels = zip(*EXAMPLES)
     model = make_pipeline(
         TfidfVectorizer(ngram_range=(1, 2), strip_accents="unicode"),
         LogisticRegression(random_state=42),
     )
     model.fit(texts, labels)
-    app.state.model = model
+    return model
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.model = train_model()
     backend = os.getenv("STORAGE_BACKEND", "sqlite")
     if backend == "firestore":
         from google.cloud import firestore
@@ -36,6 +42,11 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             client.close()
+    elif backend == "dynamodb":
+        import boto3
+
+        app.state.table = boto3.resource("dynamodb").Table(os.environ["DYNAMODB_TABLE"])
+        yield
     elif backend == "sqlite":
         path = os.getenv("SQLITE_PATH", "inference.db")
         with closing(sqlite3.connect(path)) as conn, conn:
@@ -47,7 +58,7 @@ async def lifespan(app: FastAPI):
         app.state.sqlite_path = path
         yield
     else:
-        raise ValueError("STORAGE_BACKEND must be sqlite or firestore")
+        raise ValueError("STORAGE_BACKEND must be sqlite, firestore, or dynamodb")
 
 
 app = FastAPI(
@@ -91,6 +102,11 @@ def run_inference(payload: InferenceRequest, request: Request):
     try:
         if hasattr(state, "collection"):
             state.collection.document(request_id).set(record, timeout=5, retry=None)
+        elif hasattr(state, "table"):
+            state.table.put_item(Item={
+                **record, "request_id": request_id,
+                "timestamp": record["timestamp"].isoformat(),
+            })
         else:
             with closing(sqlite3.connect(state.sqlite_path)) as conn, conn:
                 conn.execute(
